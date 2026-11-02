@@ -16,9 +16,9 @@ Upstream MIT attribution is retained in
 
 ## Test build status
 
-**Ready for experimental Apple Silicon macOS DAW testing. Not yet a
-production release.** Both independent plugins build successfully as CLAP
-and VST3 bundles, with separate host identities:
+**Ready for experimental Apple Silicon macOS and Linux x86_64 DAW testing.
+Not yet a production release.** Both independent plugins build successfully
+as CLAP and VST3 bundles, with separate host identities:
 
 | Effect | Source package | CLAP output | VST3 output |
 | --- | --- | --- | --- |
@@ -34,16 +34,20 @@ cargo xtask bundle oxidation-matrixverb --release --locked
 sh scripts/check-simd.sh
 ```
 
-The four outputs are in `target/bundled/`. Share only the four names listed
-above; old `oxide` or `oxide-windows` bundles left in a reused build directory
-are not part of this test set. Preserve each bundle's complete directory
-structure when copying or archiving it.
+The four outputs are in `target/bundled/` by default; the
+[Linux quick start](#linux-quick-start-build-and-share) uses
+`target/linux/bundled/`. Share only the four names listed above; old `oxide`
+or `oxide-windows` bundles left in a reused build directory are not part of
+this test set. Preserve each bundle's complete directory structure when
+copying or archiving it.
 
 Local validation includes workspace tests, four-mode DSP and transition
 tests, allocation checks, C++ reference comparisons, and packed SIMD/FMA
 code-generation checks. Actual DAW scanning, playback, automation, and
 session recall still need the [host test checklist](#first-daw-test).
-Native Linux, Intel macOS, and Windows execution remain unverified.
+Linux x86_64 portable and CPU-native tests, C++ reference comparisons,
+CLAP/VST3 builds, and factory discovery checks passed on an i7-6700K.
+Linux DAW use, Intel macOS, and Windows execution remain unverified.
 macOS bundles are ad-hoc signed, not Developer ID signed or notarized.
 Start at low monitoring volume in a disposable session.
 
@@ -82,10 +86,12 @@ throughput with approximate math and SIMD/FMA**; its original-math modes
 still trail C++. See the [four-mode processor table](#matrixverb-full-processor-performance)
 and [DSP validation and methodology](crates/matrixverb-dsp/README.md).
 
-These are **DSP measurements**, not whole-plugin speedups or x86 results.
-Compiler auto-vectorization is disabled; only accelerated Rust modes use
-explicit SIMD/FMA. Both plugins run two live backends for seamless math
-switching, adding work not represented by single-backend comparisons.
+These are **DSP measurements**, not whole-plugin speedups. The Linux
+measurements compare portable and CPU-native builds on one i7-6700K; they
+are not predictions for other CPUs. Compiler auto-vectorization is disabled;
+only accelerated Rust modes use explicit SIMD/FMA. Both plugins run two live
+backends for seamless math switching, adding work not represented by
+single-backend comparisons.
 The [profiling notes](#profiling-driven-optimization) explain the measured
 optimizations and remaining limitations.
 
@@ -165,15 +171,18 @@ This root README is the canonical source for all performance results and
 per-tactic comparisons. DSP sub-READMEs document implementation, validation,
 and reproduction commands, and link here rather than duplicating results.
 
-Fresh C++ and Rust measurements, in nanoseconds per native-rate sample:
-256-frame blocks, damping step 5, both tone filters enabled. Values average
-two 11-round medians, with Rust mode order reversed on the second run.
-This is a core-only comparison, not whole-plugin CPU usage. Lower is faster.
+C++ and Rust measurements, in nanoseconds per native-rate sample:
+256-frame blocks, damping step 5, both tone filters enabled. Apple values
+average two 11-round medians, with Rust mode order reversed on the second
+run. Linux values are the median of four 11-round medians, alternating Rust
+mode order and balancing build order. This is a core-only comparison, not
+whole-plugin CPU usage. Lower is faster.
 
 | C++ | O/S | A/S | O/H | A/H |
 | ---: | ---: | ---: | ---: | ---: |
 | Apple M4 Pro: 14.745 | 9.716 | 9.249 | 5.489 | 5.529 |
-| Linux x86_64: — | — | — | — | — |
+| Linux i7-6700K, portable: 27.068 | 22.031 | 21.206 | 58.450 | 58.415 |
+| Linux i7-6700K, CPU-native: 26.056 | 22.048 | 22.362 | 15.880 | 16.256 |
 
 **Legend:** C++ = original reference; O = original math; A = approximate
 math; S = scalar, unfused; H = CPU SIMD/FMA acceleration.
@@ -197,15 +206,20 @@ no speed benefit to the accelerated path. Small differences are descriptive
 of these runs, not statistically established effects. Overlapping min/max
 timing ranges do not negate the large measured SIMD/FMA improvement.
 
-Linux values are pending a native Linux run. The Rust benchmark command is:
+On this i7, O/H changes from 58.450 to 15.880 ns/sample between the portable
+and CPU-native builds, or **3.68x** the throughput. Both builds reported
+SSE2 SIMD with hardware FMA. Native targeting changes code generation for
+the whole build, so this comparison does not isolate AVX2, FMA, or a single
+optimization. The portable Rust benchmark command is:
 
 ```sh
-RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --release --manifest-path poc/matrix/Cargo.toml --bin node-bench
+RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --locked --release --manifest-path poc/matrix/Cargo.toml --bin node-bench
 ```
 
 The C++ measurements and experimental methodology are documented in the
-[DSP experiment](poc/matrix/README.md). Treat small differences as
-machine- and run-dependent; no x86 result or whole-plugin speedup is implied.
+[DSP experiment](poc/matrix/README.md), including CPU-native reproduction.
+Treat small differences as machine- and run-dependent; no whole-plugin
+speedup is implied.
 After profiling and removing hot-loop overhead, O/H is about **1.77x**
 the scalar O/S throughput and **2.69x** the C++ core throughput on this M4 Pro.
 A reproducible fresh C++ comparison is available through
@@ -265,18 +279,25 @@ instance or another platform bit-for-bit. NIH-plug's host wrapper processes
 
 ### MatrixVerb full-processor performance
 
-Fresh measurements in median **ns/stereo frame**, 44.1 kHz, default controls,
-256-frame blocks, 11 measured rounds after warmup. Each value averages two
-runs, with Rust mode order reversed on the second run. Measurements include the entire
-single-backend signal path and dither, not just the Householder matrix.
+Measurements in median **ns/stereo frame**, 44.1 kHz, default controls,
+256-frame blocks, 11 measured rounds after warmup. The Apple and Linux
+aggregation and order follow the Ultralight3 table above. Measurements
+include the entire single-backend signal path and dither, not just the
+Householder matrix.
 
 | C++ | O/S | A/S | O/H | A/H |
 | ---: | ---: | ---: | ---: | ---: |
 | Apple M4 Pro: 78.980 | 99.693 | 97.255 | 97.360 | 59.900 |
-| Linux x86_64: — | — | — | — | — |
+| Linux i7-6700K, portable: 348.858 | 488.378 | 549.000 | 580.518 | 824.966 |
+| Linux i7-6700K, CPU-native: 324.022 | 399.396 | 393.682 | 362.160 | 281.246 |
 
 **Legend:** C++ = original reference; O = original math; A = approximate
 math; S = scalar, unfused; H = CPU SIMD/FMA acceleration.
+
+On the i7, the single-backend A/H result changes from 824.966 to 281.246
+ns/stereo frame between portable and CPU-native builds, or **2.93x** the
+throughput. This is a comparison of complete build configurations, not an
+isolated measurement of individual CPU instructions.
 
 **Measured effect of each tactic on this M4 Pro** (single-backend
 processing-time reductions, computed from the table above):
@@ -300,20 +321,37 @@ These comparisons measure the combined SIMD/FMA tactic, not SIMD and FMA
 individually; isolating those would require additional benchmark variants.
 
 Approximate SIMD/FMA (A/H) delivers about **1.62x** the A/S throughput and
-**1.32x** the C++ reference throughput on this machine. Original math,
-including O/H, still trails C++; SIMD does not replace its libm calls.
+**1.32x** the C++ reference throughput on the M4 Pro. Original math,
+including O/H, still trails C++ there; SIMD does not replace its libm calls.
 The actual plugin DSP runs **both** backends for seamless switching.
-Its separately measured costs were 208.601 / 207.549 / 161.048 /
+Its separately measured M4 Pro costs were 208.601 / 207.549 / 161.048 /
 160.603 ns/stereo frame for O/S / A/S / O/H / A/H, excluding host-wrapper
 overhead. The math toggle selects the output rather than stopping the
 unselected backend, so similar integrated O/A timings are expected.
 Do not equate single-backend figures with plugin CPU usage.
 
-Both tables use Rust 1.94.0 and Apple Clang 21.0.0, portable target defaults,
-and disabled auto-vectorization; only H explicitly uses SIMD/FMA.
-No CPU pinning or machine-wide isolation was used. The MatrixVerb C++
-benchmark recomputes block coefficients; its Rust single-backend benchmark
-precomputes them, while integrated Rust timing includes coefficient updates.
+The Linux integrated dual-backend DSP costs, in the same O/S / A/S / O/H /
+A/H order, were 1053.320 / 1046.870 / 1426.086 / 1400.298 ns/stereo frame
+for the portable build and 794.782 / 805.354 / 638.499 / 643.148 for the
+CPU-native build. These also exclude host-wrapper overhead.
+
+The Apple rows use Rust 1.94.0 and Apple Clang 21.0.0 with portable target
+defaults. Linux measurements were taken on 2026-11-02 on Bazzite 44 with an
+Intel Core i7-6700K, Rust 1.95.0 and GCC 16.2.1. Linux builds use portable
+defaults or `-C target-cpu=native` for Rust and `-march=native` for C++.
+All configurations disable compiler auto-vectorization; the C++ builds also
+use `-O3`, `-fno-fast-math`, `-ffp-contract=off`, and no LTO, while Rust uses
+release-profile fat LTO.
+Native builds may require CPU features unavailable on other machines.
+
+Apple runs were not CPU-pinned; Linux runs were pinned to logical CPU 3,
+whose governor reported `performance` when checked. Neither machine was
+isolated from other workloads. Among the Linux results, the four portable
+C++ MatrixVerb run medians had an 8.3% spread relative to their median, so
+small differences should not be treated as conclusive.
+The MatrixVerb C++ benchmark recomputes block coefficients; its Rust
+single-backend benchmark precomputes them, while integrated Rust timing
+includes coefficient updates.
 
 The DSP library and reproducible reference/benchmark instructions are in
 [MatrixVerb DSP](crates/matrixverb-dsp/README.md). To download the pinned
@@ -431,6 +469,25 @@ target/linux/bundled/oxidation-matrixverb.clap
 target/linux/bundled/oxidation-matrixverb.vst3/
 ```
 
+For a separate CPU-native build, run:
+
+```sh
+(
+  set -eu
+  export CARGO_TARGET_DIR="$PWD/target/linux-native"
+  export RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp -C target-cpu=native"
+  cargo xtask bundle oxidation --release --locked --target x86_64-unknown-linux-gnu
+  cargo xtask bundle oxidation-matrixverb --release --locked --target x86_64-unknown-linux-gnu
+)
+```
+
+Its four outputs are in `target/linux-native/bundled/`. This build can use
+any CPU feature available on the build machine and may not run on older or
+otherwise incompatible CPUs. Use the portable `target/linux/bundled/` build
+when sharing with machines of unknown capability. Both builds contain all
+four processing modes; the portable build also supports runtime-selected
+SIMD/FMA acceleration.
+
 To install for the current user, close your DAW first, then:
 
 ```sh
@@ -442,8 +499,12 @@ cp -R target/linux/bundled/oxidation-matrixverb.vst3 "$HOME/.vst3/"
 ```
 
 These commands replace an existing same-named plugin. Preserve any previous
-test build separately if you need to compare versions. Alternatively,
-configure the DAW to scan `target/linux/bundled/` directly.
+test build separately if you need to compare versions. To install the
+CPU-native build instead, substitute `target/linux-native/bundled/` for
+`target/linux/bundled/` in those commands. The builds share plugin IDs and
+filenames, so keep only one build of each plugin in the DAW's scan paths at
+a time. Alternatively, configure the DAW to scan one bundle directory
+directly.
 Restart/rescan the DAW and look for **oxidation** and **oxidation MatrixVerb**.
 Test either CLAP or VST3 first; each format contains the same two effects.
 
@@ -458,22 +519,37 @@ machine avoids that particular mismatch.
 This is an experimental plugin. Start with low monitoring volume in a
 disposable session, not a production project.
 
-1. Confirm scanning/loading works and stereo audio passes.
+Each bundle includes all four modes. Use the DAW's generic parameter editor
+to set the two controls:
+
+| Mode | Original-order math | Acceleration |
+| --- | --- | --- |
+| O/S | On | Off |
+| A/S | Off | Off |
+| O/H | On | On |
+| A/H | Off | On |
+
+1. Confirm scanning/loading works and stereo audio passes for both plugins
+   in each format your DAW supports.
 2. Test Damping, UnSolid, UnReflc, Predlay, Dry/Wet, Frnt/Bk, Bot/Top and
    Distnce on Ultralight3. On MatrixVerb, test Filter, Damping, Speed,
    Vibrato, RmSize, Flavor and Dry/Wet.
-3. Switch Original-order math during a sustained tail, including switching
-   back before its 50 ms transition finishes; listen for discontinuities.
+3. Try all four modes. Switch Original-order math during a sustained tail,
+   including switching back before its 50 ms transition finishes; listen for
+   discontinuities.
 4. Toggle Acceleration both ways during a sustained tail and confirm it
    changes the processing mode without clearing the reverb state.
 5. Save/reopen the session and confirm parameter and mode recall.
 6. Try 44.1/48/96 kHz and several host buffer sizes; watch CPU and output.
+   When comparing builds, use the same audio, settings, instance count, sample
+   rate, and buffer size. Host CPU usage is not the core benchmark below.
 7. Report the distro, architecture, glibc version (`ldd --version`), DAW and
-   version, plugin format, sample rate, buffer size, and reproduction steps.
-   Include the terminal error output if building or scanning fails.
+   version, plugin format, portable or CPU-native build, sample rate, buffer
+   size, and reproduction steps. Include the terminal error output if
+   building or scanning fails.
 
-Automated tests do not substitute for this host test. Linux build and
-DAW compatibility remain unverified until run on Linux.
+Automated tests do not substitute for this host test. Linux CLAP and VST3
+bundles were built and inspected, but DAW compatibility remains unverified.
 
 ### Other native builds
 

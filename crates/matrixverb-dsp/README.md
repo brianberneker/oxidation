@@ -36,8 +36,8 @@ Ultralight3's plugin and identities are not changed by this addition.
   [CPU backend](../../poc/matrix/src/acceleration.rs). Apple Silicon uses
   NEON/FMA. x86_64 uses SSE2 and runtime-detected FMA, falling back to scalar
   fused lane operations on CPUs without FMA. Both plugin initialization and
-  benchmarks explicitly report the selected backend. Only ARM execution
-  and x86_64 cross-compilation have been validated locally.
+  benchmarks explicitly report the selected backend. ARM and Linux x86_64
+  execution have been validated locally; Linux DAW testing remains pending.
 - Coefficient updates occur outside the sample loop and retain the reference's
   tangent/power mapping. Room size changes preserve upstream ring histories,
   even when a cursor temporarily lies beyond the new logical delay.
@@ -129,11 +129,44 @@ C++ uses `-O3 -fno-fast-math -ffp-contract=off` and disables vectorization.
 Rust uses the workspace release profile and disables auto-vectorization.
 Explicit SIMD/FMA is used only in accelerated modes. Compiler settings in
 the workspace preserve scalar math in the nonaccelerated modes.
-Neither build uses native CPU tuning. The C++ processor is compiled as a
-separate translation unit without LTO; Rust uses workspace fat LTO.
+The portable builds use default CPU targets; the Linux CPU-native comparison
+adds `-march=native` for C++ and `-C target-cpu=native` for Rust. The C++
+processor is compiled as a separate translation unit without LTO; Rust uses
+workspace fat LTO.
 C++ recomputes coefficients each block; the single-backend Rust benchmark
 precomputes `Tuning` outside timing. The integrated Rust measurement includes
 coefficient updates and both live backends but not host-wrapper work.
+
+To reproduce the CPU-native Linux configuration from the repository root,
+first run `sh scripts/matrixverb-reference.sh` to fetch the pinned C++ source,
+then:
+
+```sh
+(
+  set -eu
+  export CARGO_TARGET_DIR="$PWD/target/linux-native"
+  export RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp -C target-cpu=native"
+  mkdir -p "$CARGO_TARGET_DIR/reference"
+  c++ -std=c++17 -O3 -march=native -fno-fast-math -ffp-contract=off \
+    -fno-tree-vectorize -fno-tree-slp-vectorize \
+    -include crates/matrixverb-dsp/tests/reference/MatrixVerb.h \
+    target/matrixverb-reference/MatrixVerbProc.cpp \
+    crates/matrixverb-dsp/tests/reference/runner.cpp \
+    -o "$CARGO_TARGET_DIR/reference/matrixverb-reference"
+  export MATRIXVERB_REFERENCE="$CARGO_TARGET_DIR/reference/matrixverb-reference"
+  cargo test --locked --release --target x86_64-unknown-linux-gnu \
+    --package oxidation-matrixverb-dsp --test reference -- --ignored --nocapture
+  cargo build --locked --release --target x86_64-unknown-linux-gnu \
+    --package oxidation-matrixverb-dsp --bin matrixverb-bench
+  "$MATRIXVERB_REFERENCE" bench
+  "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/matrixverb-bench"
+  "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/matrixverb-bench" reverse
+)
+```
+
+For the four-pass protocol in the root README, run the C++ command four
+times and each Rust order twice, interleaving portable and native builds.
+The native binaries require a CPU compatible with the build machine.
 
 See the [main performance table](../../README.md#matrixverb-full-processor-performance)
 for all measured results, per-tactic comparisons, integrated dual-backend

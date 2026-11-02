@@ -284,6 +284,35 @@ are published only in the root README, including the distinction between
 core-only and whole-plugin measurements. The benchmark treats SIMD/FMA
 as one tactic, not two separately timed features.
 
+To reproduce the CPU-native Linux configuration from the repository root,
+first run the reference script to obtain the pinned `core.cpp`, then:
+
+```sh
+(
+  set -eu
+  export CARGO_TARGET_DIR="$PWD/target/linux-native"
+  export RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp -C target-cpu=native"
+  mkdir -p "$CARGO_TARGET_DIR/reference"
+  c++ -std=c++17 -O3 -march=native -fno-fast-math -ffp-contract=off \
+    -fno-tree-vectorize -fno-tree-slp-vectorize \
+    -I poc/matrix/reference target/ultralight-reference/core.cpp \
+    poc/matrix/reference/ultralight-runner.cpp \
+    -o "$CARGO_TARGET_DIR/reference/ultralight-reference"
+  cargo build --locked --release --target x86_64-unknown-linux-gnu \
+    --manifest-path poc/matrix/Cargo.toml --bin node-bench
+  "$CARGO_TARGET_DIR/reference/ultralight-reference" corpus > "$CARGO_TARGET_DIR/reference/reference.bin"
+  "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/node-bench" \
+    verify "$CARGO_TARGET_DIR/reference/reference.bin"
+  "$CARGO_TARGET_DIR/reference/ultralight-reference" bench
+  "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/node-bench"
+  "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/node-bench" reverse
+)
+```
+
+For the four-pass protocol in the root README, run the C++ command four
+times and each Rust order twice, interleaving portable and native builds.
+The native binaries require a CPU compatible with the build machine.
+
 Native sampling and disassembly found vector constant construction lowering
 to memory-fill calls. The shared SIMD helpers now construct lanes explicitly.
 Feedback and filter vectors remain register-resident across borrowed windows
