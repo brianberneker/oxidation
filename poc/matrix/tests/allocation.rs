@@ -59,8 +59,10 @@ fn node_processing_performs_zero_heap_allocations() {
     TRACKING.with(|tracking| tracking.set(true));
     (0..100).for_each(|_| {
         original.process(&input, &mut output, parameters);
-        borrowed.process(&input, &mut output, parameters);
-        approximate.process(&input, &mut output, parameters);
+        for accelerated in [false, true] {
+            borrowed.process_with_acceleration(&input, &mut output, parameters, accelerated);
+            approximate.process_with_acceleration(&input, &mut output, parameters, accelerated);
+        }
     });
     TRACKING.with(|tracking| tracking.set(false));
     assert_eq!(ALLOCATIONS.with(Cell::get), 0);

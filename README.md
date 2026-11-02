@@ -14,6 +14,43 @@ oxidation is not an official Airwindows release or an endorsed project.
 Upstream MIT attribution is retained in
 [LICENSE.airwindows](poc/matrix/LICENSE.airwindows).
 
+## Test build status
+
+**Ready for experimental Apple Silicon macOS DAW testing. Not yet a
+production release.** Both independent plugins build successfully as CLAP
+and VST3 bundles, with separate host identities:
+
+| Effect | Source package | CLAP output | VST3 output |
+| --- | --- | --- | --- |
+| Ultralight3 | [plugins/ultralight3](plugins/ultralight3) | `oxidation.clap` | `oxidation.vst3` |
+| MatrixVerb | [plugins/matrixverb](plugins/matrixverb) | `oxidation-matrixverb.clap` | `oxidation-matrixverb.vst3` |
+
+Build both from the repository root:
+
+```sh
+cargo test --locked --release --workspace
+cargo xtask bundle oxidation --release --locked
+cargo xtask bundle oxidation-matrixverb --release --locked
+sh scripts/check-simd.sh
+```
+
+The four outputs are in `target/bundled/`. Share only the four names listed
+above; old `oxide` or `oxide-windows` bundles left in a reused build directory
+are not part of this test set. Preserve each bundle's complete directory
+structure when copying or archiving it.
+
+Local validation includes workspace tests, four-mode DSP and transition
+tests, allocation checks, C++ reference comparisons, and packed SIMD/FMA
+code-generation checks. Actual DAW scanning, playback, automation, and
+session recall still need the [host test checklist](#first-daw-test).
+Native Linux, Intel macOS, and Windows execution remain unverified.
+macOS bundles are ad-hoc signed, not Developer ID signed or notarized.
+Start at low monitoring volume in a disposable session.
+
+Performance results and the effect of each optimization tactic are in the
+[Ultralight3 table](#ultralight3-core-performance) and
+[MatrixVerb table](#matrixverb-full-processor-performance) below.
+
 ## What we are demonstrating
 
 Rust lets us describe exclusive access to preallocated audio state in a way
@@ -32,20 +69,45 @@ and better visibility into non-aliasing. A copied-tile experiment was slower
 and was discarded. Similar scheduling is possible in C++; Rust offers a
 particularly useful, safely enforced way to express it.
 
-On one Apple M4 Pro, the original-order Rust **Ultralight3 reverb core**
-measured about **2.5–2.7x the throughput** of an extracted, unchanged C++
-core with feedback tone filters disabled, and **1.6–1.7x** with all filters
-enabled. Both references used scalar arithmetic, with vectorization
-disabled and no FMA contraction. The Rust core matched 94,080,000 external
-output-bit comparisons across settings and block sizes.
+Current Apple M4 Pro measurements show the original-order Rust
+**Ultralight3 reverb core** at **1.52x C++ throughput in scalar mode** and
+**2.69x with CPU SIMD/FMA**, with all feedback tone filters enabled.
+The scalar core matched 94,080,000 external output-bit comparisons per
+implementation; accelerated modes pass separate numerical error budgets.
+See the [four-mode core table](#ultralight3-core-performance) and
+[experiment methodology](poc/matrix/README.md).
 
-These are **core-only measurements**, not a whole-plugin speedup, an x86
-result, or a comparison of FMA implementations. The plugin
-below also runs two backends for seamless switching and includes additional
-sample-rate and mixing work. See the [experiment and methodology](poc/matrix/README.md)
-before quoting the numbers.
+The complete single-backend **MatrixVerb** processor reaches **1.32x C++
+throughput with approximate math and SIMD/FMA**; its original-math modes
+still trail C++. See the [four-mode processor table](#matrixverb-full-processor-performance)
+and [DSP validation and methodology](crates/matrixverb-dsp/README.md).
 
-## The plugin
+These are **DSP measurements**, not whole-plugin speedups or x86 results.
+Compiler auto-vectorization is disabled; only accelerated Rust modes use
+explicit SIMD/FMA. Both plugins run two live backends for seamless math
+switching, adding work not represented by single-backend comparisons.
+The [profiling notes](#profiling-driven-optimization) explain the measured
+optimizations and remaining limitations.
+
+## Ultralight3 plugin
+
+### Repository layout
+
+Each plugin has a separate, visibly named package directory. The root
+`Cargo.toml` is a virtual workspace; there is no implicit root plugin.
+
+```text
+plugins/
+  ultralight3/   # Ultralight3 plugin (Cargo package: oxidation)
+  matrixverb/   # MatrixVerb plugin (Cargo package: oxidation-matrixverb)
+crates/
+  matrixverb-dsp/
+poc/matrix/     # Shared matrix/SIMD kernels and Ultralight3 delay core
+```
+
+See [Ultralight3 source](plugins/ultralight3) and
+[MatrixVerb source](plugins/matrixverb). Existing build commands, bundle
+names, and host IDs are unchanged by this layout.
 
 oxidation is a full Rust port of Ultralight3's stereo `processReplacing`
 signal path: the sixteen-delay feedback network, predelay and three
@@ -68,18 +130,24 @@ Controls appear in the host's generic parameter UI; there is no custom editor:
 | Bot/Top | 0 | Selects between floor and ceiling reverb taps. |
 | Distnce | 0 | FastDistance2 distance filtering. |
 | Original-order math | On | Retains the validated scalar evaluation order. |
-| Acceleration | Off | Uses fused multiply-add arithmetic when enabled; may change rounding. |
+| Acceleration | Off | Enables CPU SIMD/FMA; may change rounding and is not guaranteed faster. |
 
 The two Rust toggles produce four modes. Original-order math is the default;
 approximate math balances a four-value reduction and is tested against an
 error budget and long-tail stability checks. Acceleration is independently
-off by default and uses `f32::mul_add()` in the delay network, filters and
-mixing path. Rust selects hardware FMA where the target supports it; no SIMD
-intrinsics or optional CPU requirement are used. FMA changes rounding and
-is not guaranteed to be faster on every target. Switching Original-order
+off by default. When on, it uses four-wide `f32` SIMD/FMA for the delay
+network, feedback filters, predelay/allpasses, distance filters and wet/dry
+mixing. On Apple Silicon this uses NEON; on x86_64 it uses SSE2 with
+runtime-checked hardware FMA. CPUs without FMA use an explicitly reported
+scalar fused fallback for fused operations, while retaining SIMD for other
+vector arithmetic. Switching Original-order
 math crossfades the continuously running node histories over 50 ms.
-Changing Acceleration selects fused arithmetic immediately and does not
+Changing Acceleration selects SIMD/FMA immediately and does not
 reset the delay state.
+The workspace disables compiler auto-vectorization so that acceleration
+off remains scalar/unfused. Acceleration on uses explicit SIMD, independent
+of those compiler settings. SIMD and FMA are CPU features, not GPU/Metal
+offload; acceleration is an implementation choice, not a speed guarantee.
 
 The internal reverb rate is 48 kHz. Its causal linear sample-rate adapter
 supports host rates from 8 to 384 kHz; this is not a band-limited mastering
@@ -93,19 +161,41 @@ truncated by silence-based suspension.
 
 ### Ultralight3 core performance
 
-The table reports nanoseconds per native-rate sample for a 256-frame block
-with damping step 5 and both tone filters enabled. Each Rust value is the
-average of the medians from two `node-bench` runs, one in forward toggle
-order and one in reverse order, on the Apple M4 Pro. The C++ column is the
-previously measured extracted upstream core. The Rust timing ranges overlap,
-so these measurements do not establish a performance benefit from either
-toggle. This is a core-only comparison, not whole-plugin CPU usage. Lower is
-faster.
+This root README is the canonical source for all performance results and
+per-tactic comparisons. DSP sub-READMEs document implementation, validation,
+and reproduction commands, and link here rather than duplicating results.
 
-| Original C++ reference | Original math / acceleration off | Approximate math / acceleration off | Original math / acceleration on | Approximate math / acceleration on |
+Fresh C++ and Rust measurements, in nanoseconds per native-rate sample:
+256-frame blocks, damping step 5, both tone filters enabled. Values average
+two 11-round medians, with Rust mode order reversed on the second run.
+This is a core-only comparison, not whole-plugin CPU usage. Lower is faster.
+
+| C++ | O/S | A/S | O/H | A/H |
 | ---: | ---: | ---: | ---: | ---: |
-| Apple M4 Pro: 14.591 | 9.107 | 9.172 | 9.142 | 9.215 |
+| Apple M4 Pro: 14.745 | 9.716 | 9.249 | 5.489 | 5.529 |
 | Linux x86_64: — | — | — | — | — |
+
+**Legend:** C++ = original reference; O = original math; A = approximate
+math; S = scalar, unfused; H = CPU SIMD/FMA acceleration.
+
+**Measured effect of each tactic on this M4 Pro** (processing-time reductions,
+computed from the table above):
+
+- Approximate math alone, O/S -> A/S: 9.716 -> 9.249 ns/sample,
+  **4.8% less time**.
+- SIMD/FMA with original math, O/S -> O/H: 9.716 -> 5.489,
+  **43.5% less time (1.77x throughput)**.
+- SIMD/FMA with approximate math, A/S -> A/H: 9.249 -> 5.529,
+  **40.2% less time (1.67x throughput)**.
+- Approximate math with SIMD/FMA already enabled, O/H -> A/H:
+  5.489 -> 5.529, **0.7% more time**; no measured additional speedup.
+- Both tactics versus original/scalar, O/S -> A/H: 9.716 -> 5.529,
+  **43.1% less time (1.76x throughput)**.
+
+SIMD/FMA is the dominant measured improvement here; approximate math adds
+no speed benefit to the accelerated path. Small differences are descriptive
+of these runs, not statistically established effects. Overlapping min/max
+timing ranges do not negate the large measured SIMD/FMA improvement.
 
 Linux values are pending a native Linux run. The Rust benchmark command is:
 
@@ -116,13 +206,181 @@ RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --release --mani
 The C++ measurements and experimental methodology are documented in the
 [DSP experiment](poc/matrix/README.md). Treat small differences as
 machine- and run-dependent; no x86 result or whole-plugin speedup is implied.
+After profiling and removing hot-loop overhead, O/H is about **1.77x**
+the scalar O/S throughput and **2.69x** the C++ core throughput on this M4 Pro.
+A reproducible fresh C++ comparison is available through
+`sh scripts/ultralight-reference.sh`; each Rust benchmark mode starts from
+reset state before identical warmup.
+
+## MatrixVerb plugin
+
+**oxidation MatrixVerb** is a separate stereo CLAP/VST3 plugin; the existing
+Ultralight3 plugin and its host identities are unchanged. It ports the pinned
+Airwindows MatrixVerb processor, not just its matrix kernel: stereo predelay,
+four parallel input allpasses, eight modulated delay lines per channel,
+Householder feedback, sequential A/E crossmodulation, three stereo biquads,
+sine/arcsine encoding, upstream dry/wet behavior, denormal input noise and
+32-bit output dither. Internal math and delay storage use `f64`.
+
+All seven original normalized controls retain their upstream defaults:
+
+| Control | Default |
+| --- | ---: |
+| Filter | 1 |
+| Damping | 0 |
+| Speed | 0 |
+| Vibrato | 0 |
+| RmSize | 0.5 |
+| Flavor | 0.5 |
+| Dry/Wet | 1 |
+
+Original-order math defaults on; Acceleration defaults off. Original math
+retains the upstream `f64` sine/arcsine and matrix evaluation order.
+Approximate math replaces sine/arcsine with range-reduced polynomials and
+balances matrix/output reductions. Acceleration independently selects
+two-wide `f64` SIMD/FMA across left/right channels: biquads, allpasses,
+delay interpolation, feedback matrices and mixing. The approximate backend
+also evaluates its polynomials in SIMD. Original math retains the upstream
+scalar libm sine/arcsine rather than silently substituting approximations.
+Both backends use the CPU capability handling described above. Generic
+specialization selects the scalar or SIMD kernel outside the sample loop.
+
+Both backends run continuously, with a reversible 50 ms crossfade for the
+math toggle. Acceleration switches immediately without clearing histories.
+Processing and reset allocate no memory. Host sample rates from 22.05 to
+384 kHz are supported; unlike Ultralight3, MatrixVerb runs its delay network
+directly at the host rate, matching the reference's sample-rate behavior.
+NIH-plug supplies the host floating-point denormal handling. The standalone
+DSP processor inherits its caller's floating-point environment.
+
+Startup modulation phases and noise seeds are deterministic instead of the
+upstream constructor's platform-dependent `rand()` initialization. The
+seeded full-path C++ comparison covers float and double processing, six
+sample rates, ten control/silence/automation scenarios, and 7,864,320 output
+samples per mode, covering all four modes. On this M4 Pro, original math with acceleration off produced **zero
+observed error** in both precisions. This is finite-corpus evidence under
+matching initial state, not a guarantee of matching an arbitrary upstream
+instance or another platform bit-for-bit. NIH-plug's host wrapper processes
+32-bit buffers; the double path is available in the DSP library/test harness.
+
+### MatrixVerb full-processor performance
+
+Fresh measurements in median **ns/stereo frame**, 44.1 kHz, default controls,
+256-frame blocks, 11 measured rounds after warmup. Each value averages two
+runs, with Rust mode order reversed on the second run. Measurements include the entire
+single-backend signal path and dither, not just the Householder matrix.
+
+| C++ | O/S | A/S | O/H | A/H |
+| ---: | ---: | ---: | ---: | ---: |
+| Apple M4 Pro: 78.980 | 99.693 | 97.255 | 97.360 | 59.900 |
+| Linux x86_64: — | — | — | — | — |
+
+**Legend:** C++ = original reference; O = original math; A = approximate
+math; S = scalar, unfused; H = CPU SIMD/FMA acceleration.
+
+**Measured effect of each tactic on this M4 Pro** (single-backend
+processing-time reductions, computed from the table above):
+
+- Approximate math alone, O/S -> A/S: 99.693 -> 97.255 ns/stereo frame,
+  **2.4% less time**.
+- SIMD/FMA with original math, O/S -> O/H: 99.693 -> 97.360,
+  **2.3% less time**.
+- SIMD/FMA with approximate math, A/S -> A/H: 97.255 -> 59.900,
+  **38.4% less time (1.62x throughput)**.
+- Approximate math with SIMD/FMA already enabled, O/H -> A/H:
+  97.360 -> 59.900, **38.5% less time (1.63x throughput)**.
+- Both tactics versus original/scalar, O/S -> A/H: 99.693 -> 59.900,
+  **39.9% less time (1.66x throughput)**.
+
+The tactics interact: neither alone shows a large improvement here, but
+their combination does. The roughly 2% differences are small observed
+changes, not statistically established wins; they must not be used to
+dismiss the roughly 40% reduction achieved by combining the tactics.
+These comparisons measure the combined SIMD/FMA tactic, not SIMD and FMA
+individually; isolating those would require additional benchmark variants.
+
+Approximate SIMD/FMA (A/H) delivers about **1.62x** the A/S throughput and
+**1.32x** the C++ reference throughput on this machine. Original math,
+including O/H, still trails C++; SIMD does not replace its libm calls.
+The actual plugin DSP runs **both** backends for seamless switching.
+Its separately measured costs were 208.601 / 207.549 / 161.048 /
+160.603 ns/stereo frame for O/S / A/S / O/H / A/H, excluding host-wrapper
+overhead. The math toggle selects the output rather than stopping the
+unselected backend, so similar integrated O/A timings are expected.
+Do not equate single-backend figures with plugin CPU usage.
+
+Both tables use Rust 1.94.0 and Apple Clang 21.0.0, portable target defaults,
+and disabled auto-vectorization; only H explicitly uses SIMD/FMA.
+No CPU pinning or machine-wide isolation was used. The MatrixVerb C++
+benchmark recomputes block coefficients; its Rust single-backend benchmark
+precomputes them, while integrated Rust timing includes coefficient updates.
+
+The DSP library and reproducible reference/benchmark instructions are in
+[MatrixVerb DSP](crates/matrixverb-dsp/README.md). To download the pinned
+MIT-licensed upstream source, compile its unmodified processor with a seeded
+state shim, compare full outputs and benchmark all four modes:
+
+```sh
+sh scripts/matrixverb-reference.sh
+```
+
+This optional comparison requires `curl` and a C++17 compiler on macOS/Linux.
+Normal plugin builds and Rust tests need neither C++ nor reference downloads.
+The C++ comparison is explicitly ignored in plain `cargo test` and run by
+the script and macOS/Linux CI instead.
+
+### Profiling-driven optimization
+
+Native macOS `sample` captures and optimized disassembly identified repeated
+`memset_pattern16` calls when `wide` constructed SIMD constants with
+auto-vectorization disabled. In the initial MatrixVerb A/H capture, roughly
+60% of samples were in those calls or their stubs. Explicit lane construction
+removed that overhead without enabling auto-vectorization in scalar mode.
+NEON nearest-even rounding replaces the vector library's multi-operation
+rounding; sign masks avoid generic constant construction. Follow-up
+disassembly confirms no memory-fill calls in the single-processor kernels.
+
+Ultralight3 also keeps feedback/filter vectors in registers across the
+borrowed-window loop, stores them at block exit, and constructs tone masks
+once per block. Inactive filter histories and live acceleration changes are
+preserved and regression-tested. MatrixVerb's approximate sine folds its
+range to [-pi/2, pi/2] and uses a degree-15 Estrin polynomial to shorten
+arithmetic dependency chains; original libm math is unchanged.
+
+Compared with the first SIMD implementation, accelerated Ultralight3 fell
+from about 16.1 to 5.5 ns/sample and approximate accelerated MatrixVerb from
+163.8 to 59.9 ns/stereo frame. Those before/after figures describe the
+implementation improvement, not controlled cross-machine measurements.
+The tables above replace the initial results with fresh forward/reverse
+runs. All four modes still pass the C++ error budgets; original/scalar
+MatrixVerb has zero observed error, and the Ultralight3 scalar node retains
+94,080,000 bit-identical comparisons per implementation.
+
+For isolated 12-second profiling workloads (modes `os`, `as`, `oh`, `ah`):
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --locked --release --package oxidation-matrixverb-dsp --bin matrixverb-bench
+target/release/matrixverb-bench profile ah
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --locked --release --manifest-path poc/matrix/Cargo.toml --bin node-bench
+poc/matrix/target/release/node-bench profile oh
+```
+
+Each workload prints its PID. On macOS, attach from another terminal with
+`sample PID 3 1 -file /tmp/oxidation.sample.txt`. Full Xcode's Time Profiler
+was unavailable on this machine, so these captures used the native sampler.
+Run benchmarks without the profiler or competing workloads.
+Original MatrixVerb still has scalar transcendental calls, vector/scalar
+transitions, and delay bookkeeping; this work does not establish a speedup
+for its original-math backend over C++. Native Intel/Linux profiling and
+actual-host callback measurements remain pending.
 
 ## Roadmap
 
 - Validate the plugin in real hosts, measure whole-plugin CPU and callback
   timing, improve sample-rate conversion, and publish cross-platform results.
-- Extend the shared test harness and modular backend approach to MatrixVerb
-  and other Airwindows algorithms.
+- Extend native profiling to Intel/Linux and measure actual-host callback
+  latency and dual-backend overhead before claiming whole-plugin speedups.
+- Extend to other Airwindows algorithms.
 
 ## Build targets
 
@@ -133,8 +391,9 @@ machine- and run-dependent; no x86 result or whole-plugin speedup is implied.
 ### Linux quick start: build and share
 
 Open or copy the complete checkout on an **x86_64 GNU/Linux** machine.
-Include both Cargo lockfiles, `xtask/`, `.cargo/`, and `poc/matrix/`;
-the plugin uses the Rust library in that directory. You do not need any
+Include both Cargo lockfiles, `xtask/`, `.cargo/`, `plugins/`, `crates/`,
+and `poc/matrix/`; the plugins use the Rust libraries in those directories.
+You do not need any
 existing `target/` directories or the external C++ reference harness.
 An internet connection is needed for the initial dependency downloads.
 
@@ -157,7 +416,7 @@ sh scripts/build-linux.sh
 ```
 
 The script runs the plugin and DSP tests in release mode, then bundles both
-plugin formats. It disables compiler auto-vectorization for this scalar
+plugins in both formats. It disables compiler auto-vectorization for this scalar
 experiment, uses locked dependencies and portable target defaults rather
 than `target-cpu=native`, and stops on a failed test or build. It requires a
 native x86_64 GNU/Linux Rust host; ARM Linux and musl are not validated targets.
@@ -168,6 +427,8 @@ Outputs are separated from other platforms:
 ```text
 target/linux/bundled/oxidation.clap
 target/linux/bundled/oxidation.vst3/
+target/linux/bundled/oxidation-matrixverb.clap
+target/linux/bundled/oxidation-matrixverb.vst3/
 ```
 
 To install for the current user, close your DAW first, then:
@@ -176,15 +437,17 @@ To install for the current user, close your DAW first, then:
 mkdir -p "$HOME/.clap" "$HOME/.vst3"
 cp target/linux/bundled/oxidation.clap "$HOME/.clap/"
 cp -R target/linux/bundled/oxidation.vst3 "$HOME/.vst3/"
+cp target/linux/bundled/oxidation-matrixverb.clap "$HOME/.clap/"
+cp -R target/linux/bundled/oxidation-matrixverb.vst3 "$HOME/.vst3/"
 ```
 
 These commands replace an existing same-named plugin. Preserve any previous
 test build separately if you need to compare versions. Alternatively,
 configure the DAW to scan `target/linux/bundled/` directly.
-Restart/rescan the DAW and look for **oxidation**. Test either CLAP or
-VST3 first; both contain the same effect.
+Restart/rescan the DAW and look for **oxidation** and **oxidation MatrixVerb**.
+Test either CLAP or VST3 first; each format contains the same two effects.
 
-For a friend who does not want to compile, zip the two Linux outputs
+For a friend who does not want to compile, zip the four Linux outputs
 together **after the script passes on Linux**, retaining the complete VST3
 directory structure. A locally built GNU/Linux binary is not guaranteed to
 load on distributions with an older glibc; building on the friend's own
@@ -197,7 +460,8 @@ disposable session, not a production project.
 
 1. Confirm scanning/loading works and stereo audio passes.
 2. Test Damping, UnSolid, UnReflc, Predlay, Dry/Wet, Frnt/Bk, Bot/Top and
-   Distnce.
+   Distnce on Ultralight3. On MatrixVerb, test Filter, Damping, Speed,
+   Vibrato, RmSize, Flavor and Dry/Wet.
 3. Switch Original-order math during a sustained tail, including switching
    back before its 50 ms transition finishes; listen for discontinuities.
 4. Toggle Acceleration both ways during a sustained tail and confirm it
@@ -219,11 +483,15 @@ build toolchain on Linux). The DSP is Rust-only; C++ is not a build or
 runtime dependency. NIH-plug supplies the plugin-format wrappers.
 
 ```sh
-cargo test --locked --package oxidation
+cargo test --locked --workspace
 cargo xtask bundle oxidation --release --locked
+cargo xtask bundle oxidation-matrixverb --release --locked
 ```
 
 Installable CLAP and VST3 bundles are written to `target/bundled/`.
+On macOS/Linux, `sh scripts/check-simd.sh` checks those actual CLAP binaries
+for packed FMA instructions in both plugins; CI runs the same check.
+Numerical and routing tests separately verify all four configurations.
 No standalone application or Audio Unit build is configured.
 Release signing/notarization is not configured; macOS bundles receive local
 ad-hoc signing rather than Developer ID signing.
@@ -231,18 +499,22 @@ The oxidation CLAP ID is `audio.oxidation.reverb` and its VST3 class ID is
 `Oxidation0000001`. This product rename intentionally creates new host
 identities; projects using the prior oxide-windows build may need their
 plugin instance replaced.
+MatrixVerb has its own CLAP ID `audio.oxidation.matrixverb`, VST3 class ID
+`OxidationMatrix1`, and `oxidation-matrixverb` bundle filenames.
 
 For a universal macOS bundle:
 
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo xtask bundle-universal oxidation --release --locked
+cargo xtask bundle-universal oxidation-matrixverb --release --locked
 ```
 
 [Build CI](.github/workflows/build.yml) tests the plugin and scalar DSP
 and bundles both formats on each platform. Other platform builds remain
 unverified until those jobs run successfully.
-For explicitly scalar builds/experiments, set
-`RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp"`; the default compiler
-may otherwise auto-vectorize eligible code, without requiring optional
-native CPU features. The workspace folder's name need not match the app.
+The workspace disables auto-vectorization through `.cargo/config.toml`;
+explicit SIMD remains available in accelerated modes. If overriding
+`RUSTFLAGS`, retain `-C no-vectorize-loops -C no-vectorize-slp` to preserve
+the scalar/accelerated distinction. The workspace folder's name need not
+match the app.

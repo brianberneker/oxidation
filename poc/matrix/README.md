@@ -4,9 +4,9 @@ Independent, dependency-free Rust implementations of one four-input matrix
 transform from each of MatrixVerb and Ultralight3. This is not a full plugin
 port, a delay-network model, or a demonstration of whole-plugin speedup.
 The later Ultralight3 delay-network experiment below validates the
-sixteen-delay core. The root oxidation plugin now consumes this Rust library
+sixteen-delay core. The [Ultralight3 plugin](../../plugins/ultralight3) consumes this Rust library
 as part of a complete Ultralight3 signal-path port and adds selectable
-approximation and fused-arithmetic modes.
+approximation and explicit CPU SIMD/FMA modes.
 
 ## Source and numerical contract
 
@@ -85,14 +85,16 @@ truncated, mismatching, or trailing-data file is rejected. Inputs with NaN
 payloads do not have a portable bit-identity guarantee across compilers.
 Passing a finite corpus is evidence, not proof for all IEEE-754 values.
 
-The root oxidation plugin now includes those full signal-path stages.
+The [Ultralight3 plugin](../../plugins/ultralight3) includes those full signal-path stages.
 These POC measurements still cover only the matrix kernels and node, not
 whole-plugin bit identity, whole-plugin speedup, or performance on another
 CPU; those claims require separate plugin-level comparison and measurement.
+MatrixVerb now has a separate [complete DSP port and reference comparison](../../crates/matrixverb-dsp/README.md)
+and [CLAP/VST3 plugin](../../plugins/matrixverb). Its full-processor timings
+must not be confused with kernel-only measurements.
 
-## Initial local results
+## Isolated-matrix measurement methodology
 
-Measured on Apple M4 Pro, arm64 macOS, with Rust 1.94.0 and Apple Clang 21.0.0.
 The external C++ runner compiled extracted original expressions, not the
 complete original plugins, using `-O3 -fno-fast-math -ffp-contract=off
 -fno-vectorize -fno-slp-vectorize`. Its kernels and timing driver were separate
@@ -100,17 +102,6 @@ translation units without LTO. Rust used the release profile and flags above.
 Neither build used native CPU tuning or explicit SIMD. C++ pointers were
 unqualified; Rust slices carry their normal non-aliasing guarantees.
 
-Two sequential passes, with benchmark order reversed:
-
-| Kernel | C++ median ns/transform | Rust median ns/transform |
-| --- | --- | --- |
-| MatrixVerb, pass 1 | 0.922 | 0.914 |
-| MatrixVerb, pass 2 | 0.924 | 0.917 |
-| Ultralight3, pass 1 | 0.674 | 0.676 |
-| Ultralight3, pass 2 | 0.677 | 0.675 |
-
-These are approximately equal throughput, not a meaningful demonstrated
-speedup. Observed round-to-round variation was larger than the differences.
 Assembly inspection found scalar arithmetic, no FMA or packed arithmetic,
 and no per-sample bounds checks in the Rust loops. Both languages generated
 the same number of FP arithmetic operations: MatrixVerb used seven adds,
@@ -124,10 +115,9 @@ output bit patterns matched. The test suite also checks cancellation,
 block-size handling, malformed oracle files and a driven matrix recurrence.
 The recurrence is not a full reverb tail or delay-network stability test.
 
-This result does not support a claim that switching to Rust alone vastly
-outperforms these C++ matrix kernels. The figures above use the scalar
-non-FMA path; the separate four-mode node benchmark below covers fused
-arithmetic. Performance on x86 still requires a native measurement.
+The [root README](../../README.md#what-we-are-demonstrating) is the sole
+canonical source for performance results and conclusions. This document
+retains methodology, implementation details, and correctness validation.
 
 ## Ultralight3 delay-network experiment
 
@@ -159,6 +149,8 @@ the inner loop has no per-sample ring wrap or delay-array index check.
 Each cursor advances once per span, not once per sample. No scratch-buffer
 copies, heap allocation, unsafe DSP code, dynamic dispatch, SIMD intrinsics,
 FMA, fast math or transcendental approximations are involved.
+This describes the original/scalar path; the optional accelerated path
+described below uses explicit SIMD/FMA.
 
 The borrow checker establishes disjointness and safe lifetimes; it is not
 itself a runtime optimization pass. Removing cursor/index overhead and
@@ -184,11 +176,13 @@ RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --release --bin 
 RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --release --bin node-bench -- verify REFERENCE.bin
 ```
 
-`reverse` measures the optimized Rust version before the baseline, rather
-than after it. Each node is warmed up and then measured for 11 rounds of
-524,288 samples per round, with 16/64/256/1024-sample blocks and filters
-either all inactive or all active. State continues between blocks and rounds;
-it is never reset inside a timed section. Buffers and state are preallocated.
+`reverse` measures the four toggle combinations in reverse order.
+The current benchmark uses 256-sample blocks, damping step 5, and both
+filters active. Each mode starts from reset state, warms up, and is then
+measured for 11 rounds of 524,288 samples per round. State continues
+between blocks and rounds; it is never reset inside a timed section.
+Buffers and state are preallocated. Earlier measurements below also used
+16/64/1024-sample blocks and filters-off cases.
 The input is periodic: `((sample * 17 % 97) - 48) * 0.0001` in f32, repeating
 at each host block. This is one warmed node, not a many-instance cache test,
 a worst-case callback-latency measurement or an x86 portability result.
@@ -239,32 +233,12 @@ streams, without requiring the external binary or a C++ compiler. These
 digests are regression checks, not collision-free bitwise proofs. Neither
 the corpus nor the tests prove equivalence for every floating-point input.
 
-### Measured outcome
-
-Apple M4 Pro, scalar arithmetic, same toolchains as above. Representative
-256-frame results from the first final measurement pass:
-
-| Implementation | Filters off, ns/sample | All filters on, ns/sample |
-| --- | ---: | ---: |
-| Extracted original C++ core | 12.934 | 14.591 |
-| Samplewise Rust baseline | 8.423 | 11.105 |
-| Borrowed-window Rust | 4.829 | 8.763 |
-
-That is **2.68x / 1.67x throughput relative to the extracted C++ core**,
-and **1.74x / 1.27x relative to the samplewise Rust baseline**. In the
-reversed-order pass, borrowed Rust measured 5.030 / 9.009 ns/sample and
-C++ 12.800 / 14.608 ns/sample: 2.54x / 1.62x. Ordinary run-to-run
-variation exists; no CPU pinning or machine-wide isolation was used.
+### Scalar code-generation validation
 
 Assembly inspection found scalar arithmetic with neither packed arithmetic
 nor FMA in either node. The optimized Rust inner sample loop has no
 delay-array bounds checks; safe slice/window checks remain outside that
-loop. Tone selector dispatch/control remains. A copied-tile prototype
-was slower and was removed rather than presented as an improvement.
-
-This supports a local, bit-identical scalar **reverb-core** improvement.
-It does not establish a speedup for the entire plugin, MatrixVerb's complete
-delay network, other CPUs, or any particular FMA-enabled build.
+loop. Tone selector dispatch/control remains.
 
 ## Numerical backend interface
 
@@ -275,18 +249,56 @@ identical state layouts and static dispatch. Balanced math computes
 does not pass the bit-exact contract. Only the original-order backend is
 covered by the original C++ golden digests.
 
-The root plugin runs separate live instances and crossfades the original-order
+The Ultralight3 plugin runs separate live instances and crossfades the original-order
 and approximate-math outputs; changing that mode does not reset or reinterpret
 node memory. Acceleration changes arithmetic in those live nodes without
 resetting their histories. Plugin integration is not included in the
-core-only benchmark numbers above.
+core-only benchmark.
 
 The node exposes a separate acceleration switch. Its enabled path uses
-`f32::mul_add()` for the delay feedback operations, preserving scalar
-processing while allowing targets with hardware FMA to use fused
-instructions. FMA changes rounding and is not guaranteed to improve
-throughput on every CPU. The four combinations are benchmarked by:
+four-wide `f32` SIMD/FMA for delay feedback writes, matrix transforms and
+masked feedback filters. Apple Silicon uses NEON/FMA; x86_64 uses SSE2 plus
+runtime-checked FMA, with an explicitly reported scalar fused fallback if
+FMA is unavailable. The small intrinsic boundary is isolated in
+[acceleration.rs](src/acceleration.rs); buffers and processing remain safe Rust.
+Compiler auto-vectorization is disabled in both builds, independently of
+explicit SIMD. Numerical tests cover all four modes across 75 tone/damping
+settings, block boundaries, ten-second tails and allocation checks.
+Acceleration/filter automation is compared blockwise against single-sample
+processing, including empty blocks and inactive-filter state retention.
+SIMD/FMA changes rounding and does not guarantee faster processing.
+The four combinations are benchmarked by:
 
 ```sh
 RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp" cargo run --release --bin node-bench
 ```
+
+From the repository root, `sh scripts/ultralight-reference.sh` downloads the
+pinned processor, extracts its unchanged A-through-P and feedback-filter
+statements, builds a C++17 core runner without LTO/FMA/vectorization,
+regenerates the 75-case external corpus, verifies all 94,080,000 comparisons
+per scalar Rust node, and measures C++ plus the four Rust modes. The shim
+retains upstream array capacities, initial cursors and zeroed state. The
+results and [per-tactic comparisons](../../README.md#ultralight3-core-performance)
+are published only in the root README, including the distinction between
+core-only and whole-plugin measurements. The benchmark treats SIMD/FMA
+as one tactic, not two separately timed features.
+
+Native sampling and disassembly found vector constant construction lowering
+to memory-fill calls. The shared SIMD helpers now construct lanes explicitly.
+Feedback and filter vectors remain register-resident across borrowed windows
+and are written back at block exit; tone masks are constructed once per block.
+Inactive filters retain their histories, including across acceleration changes.
+See the [profiling notes](../../README.md#profiling-driven-optimization).
+
+For an isolated 12-second profiling workload, build from the repository root:
+
+```sh
+CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --locked --release --manifest-path poc/matrix/Cargo.toml --bin node-bench
+poc/matrix/target/release/node-bench profile oh
+```
+
+Modes `os`, `as`, `oh`, and `ah` select each toggle combination. The process
+prints its PID for a native profiler; on macOS, attach with
+`sample PID 3 1 -file /tmp/ultralight.sample.txt` from another terminal.
+Run normal benchmarks separately, without profiling overhead.

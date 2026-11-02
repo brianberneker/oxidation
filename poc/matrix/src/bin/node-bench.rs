@@ -2,7 +2,13 @@ use oxidation_dsp::{
     dsp::core::{ApproximateNode, BorrowedNode, OriginalNode},
     parameters::NodeParameters,
 };
-use std::{env, error::Error, fs, hint::black_box, time::Instant};
+use std::{
+    env,
+    error::Error,
+    fs,
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 const ROUNDS: usize = 11;
 const SAMPLES_PER_ROUND: usize = 1 << 19;
@@ -13,8 +19,57 @@ fn main() -> Result<(), Box<dyn Error>> {
         [] => benchmark(false),
         [command] if command == "reverse" => benchmark(true),
         [command, path] if command == "verify" => verify(path)?,
-        _ => return Err("usage: node-bench [reverse | verify REFERENCE.bin]".into()),
+        [command, mode] if command == "profile" => profile(mode)?,
+        _ => {
+            return Err(
+                "usage: node-bench [reverse | verify REFERENCE.bin | profile os|as|oh|ah]".into(),
+            )
+        }
     }
+    Ok(())
+}
+
+fn profile(mode: &str) -> Result<(), Box<dyn Error>> {
+    let (original_math, accelerated) = match mode {
+        "os" => (true, false),
+        "as" => (false, false),
+        "oh" => (true, true),
+        "ah" => (false, true),
+        _ => return Err("profile mode must be os, as, oh, or ah".into()),
+    };
+    let input: [f32; 256] = std::array::from_fn(|frame| ((frame * 17 % 97) as f32 - 48.0) * 0.0001);
+    let mut output = [[0.0; 8]; 256];
+    let mut original = BorrowedNode::default();
+    let mut approximate = ApproximateNode::default();
+    let parameters = NodeParameters::new(5, 0, 0).unwrap();
+    println!("profiling PID {}, mode {mode}", std::process::id());
+    let start = Instant::now();
+    let mut frames = 0;
+    while start.elapsed() < Duration::from_secs(12) {
+        (0..256).for_each(|_| {
+            if original_math {
+                original.process_with_acceleration(
+                    black_box(&input),
+                    black_box(&mut output),
+                    black_box(parameters),
+                    accelerated,
+                );
+            } else {
+                approximate.process_with_acceleration(
+                    black_box(&input),
+                    black_box(&mut output),
+                    black_box(parameters),
+                    accelerated,
+                );
+            }
+            black_box(&output);
+        });
+        frames += 256 * input.len();
+    }
+    println!(
+        "{:.3} ns/sample",
+        start.elapsed().as_secs_f64() * 1e9 / frames as f64
+    );
     Ok(())
 }
 
@@ -28,6 +83,7 @@ fn benchmark(reverse: bool) {
     let mut original = BorrowedNode::default();
     let mut approximate = ApproximateNode::default();
     println!("Ultralight3 core only: block={block}, damping=5, UnSolid=0, UnReflect=0");
+    println!("Acceleration: {}", oxidation_dsp::acceleration::backend());
 
     let modes = [
         ("Original math / acceleration off", true, false),
@@ -38,6 +94,8 @@ fn benchmark(reverse: bool) {
     let order = if reverse { [3, 2, 1, 0] } else { [0, 1, 2, 3] };
     for mode in order {
         let (name, original_math, accelerated) = modes[mode];
+        original.reset();
+        approximate.reset();
         let run = || {
             if original_math {
                 original.process_with_acceleration(

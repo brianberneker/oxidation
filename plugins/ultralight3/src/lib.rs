@@ -51,6 +51,10 @@ impl Plugin for Oxidation {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
+        nih_log!(
+            "oxidation CPU acceleration backend: {}",
+            oxidation_dsp::acceleration::backend()
+        );
         match self.core.init(
             buffer_config.sample_rate,
             self.params.original_order.value(),
@@ -105,7 +109,7 @@ impl Plugin for Oxidation {
 impl ClapPlugin for Oxidation {
     const CLAP_ID: &'static str = "audio.oxidation.reverb";
     const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Ultralight3 reverb with selectable Rust math and FMA modes");
+        Some("Ultralight3 reverb with selectable Rust math and CPU SIMD/FMA modes");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[

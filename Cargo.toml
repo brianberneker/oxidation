@@ -1,19 +1,7 @@
-[package]
-name = "oxidation"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
 [workspace]
-members = ["xtask"]
+members = ["xtask", "plugins/ultralight3", "plugins/matrixverb", "crates/matrixverb-dsp"]
 exclude = ["poc/matrix"]
 resolver = "2"
-
-[dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
-oxidation-dsp = { path = "poc/matrix" }
 
 [profile.release]
 opt-level = 3

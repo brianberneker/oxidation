@@ -1,4 +1,5 @@
 use super::state::{DspState, HOST_BLOCK};
+use oxidation_dsp::acceleration::{f32x4, fma32, splat32};
 use oxidation_dsp::parameters::NodeParameters;
 
 const PRIME_COUNT: usize = 999;
@@ -168,20 +169,17 @@ impl DspCore {
         let s_next = next_cursor(*s_cursor, tuning.s);
         let t_next = next_cursor(*t_cursor, tuning.t);
 
-        q_out = if accelerated {
-            (-state.q[q_next]).mul_add(0.5, r_out)
+        [q_out, r_out, s_out] = if accelerated {
+            let delayed = f32x4::new([state.q[q_next], state.r[r_next], state.s[s_next], 0.0]);
+            let feeds = f32x4::new([r_out, s_out, t_out, 0.0]);
+            let result = fma32(-delayed, splat32(0.5), feeds).to_array();
+            [result[0], result[1], result[2]]
         } else {
-            r_out - state.q[q_next] * 0.5
-        };
-        r_out = if accelerated {
-            (-state.r[r_next]).mul_add(0.5, s_out)
-        } else {
-            s_out - state.r[r_next] * 0.5
-        };
-        s_out = if accelerated {
-            (-state.s[s_next]).mul_add(0.5, t_out)
-        } else {
-            t_out - state.s[s_next] * 0.5
+            [
+                r_out - state.q[q_next] * 0.5,
+                s_out - state.r[r_next] * 0.5,
+                t_out - state.s[s_next] * 0.5,
+            ]
         };
         t_out = input;
 
@@ -195,20 +193,22 @@ impl DspCore {
         *s_cursor = s_next;
         *t_cursor = t_next;
 
-        q_out = if accelerated {
-            q_out.mul_add(0.5, state.q[*q_cursor])
+        [q_out, r_out, s_out] = if accelerated {
+            let values = f32x4::new([q_out, r_out, s_out, 0.0]);
+            let delayed = f32x4::new([
+                state.q[*q_cursor],
+                state.r[*r_cursor],
+                state.s[*s_cursor],
+                0.0,
+            ]);
+            let result = fma32(values, splat32(0.5), delayed).to_array();
+            [result[0], result[1], result[2]]
         } else {
-            q_out * 0.5 + state.q[*q_cursor]
-        };
-        r_out = if accelerated {
-            r_out.mul_add(0.5, state.r[*r_cursor])
-        } else {
-            r_out * 0.5 + state.r[*r_cursor]
-        };
-        s_out = if accelerated {
-            s_out.mul_add(0.5, state.s[*s_cursor])
-        } else {
-            s_out * 0.5 + state.s[*s_cursor]
+            [
+                q_out * 0.5 + state.q[*q_cursor],
+                r_out * 0.5 + state.r[*r_cursor],
+                s_out * 0.5 + state.s[*s_cursor],
+            ]
         };
         t_out = state.t[*t_cursor];
         state.outputs = [q_out, r_out, s_out, t_out];
@@ -250,10 +250,13 @@ impl DspCore {
             Self::fold_output(output, parameters.front_back, parameters.bottom_top)
         };
         if accelerated {
-            [
-                wet[0].mul_add(parameters.wet, dry[0] * (1.0 - parameters.wet)),
-                wet[1].mul_add(parameters.wet, dry[1] * (1.0 - parameters.wet)),
-            ]
+            let result = fma32(
+                f32x4::new([wet[0], wet[1], 0.0, 0.0]),
+                splat32(parameters.wet),
+                f32x4::new([dry[0], dry[1], 0.0, 0.0]) * splat32(1.0 - parameters.wet),
+            )
+            .to_array();
+            [result[0], result[1]]
         } else {
             [
                 wet[0] * parameters.wet + dry[0] * (1.0 - parameters.wet),
@@ -267,14 +270,11 @@ impl DspCore {
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
         let input = input * 0.5;
         if accelerated {
-            e = (distance * 0.875).mul_add(input - a - e, e);
-            f = distance.mul_add(a - b - f, f);
-            g = distance.mul_add(b - c - g, g);
-            h = distance.mul_add(c - d - h, h);
-            a = (distance * 0.875).mul_add(e, a);
-            b = distance.mul_add(f, b);
-            c = distance.mul_add(g, c);
-            d = distance.mul_add(h, d);
+            let weights = f32x4::new([distance * 0.875, distance, distance, distance]);
+            let previous = f32x4::new([a, b, c, d]);
+            let delta = f32x4::new([input, a, b, c]) - previous - f32x4::new([e, f, g, h]);
+            [e, f, g, h] = fma32(weights, delta, f32x4::new([e, f, g, h])).to_array();
+            [a, b, c, d] = fma32(weights, f32x4::new([e, f, g, h]), previous).to_array();
         } else {
             e = distance * 0.875 * (input - a - e) + e;
             f = distance * (a - b - f) + f;
@@ -500,32 +500,36 @@ mod tests {
         for rate in [
             8000.0, 11025.0, 22050.0, 44100.0, 48000.0, 88200.0, 96000.0, 192000.0, 384000.0,
         ] {
-            let output = render(rate, 64, (true, false));
-            assert!(
-                output.iter().flatten().all(|sample| sample.is_finite()),
-                "rate {rate}"
-            );
-            assert!(
-                output.iter().flatten().any(|&sample| sample != 0.0),
-                "rate {rate}"
-            );
+            for mode in [(true, false), (false, false), (true, true), (false, true)] {
+                let output = render(rate, 64, mode);
+                assert!(
+                    output.iter().flatten().all(|sample| sample.is_finite()),
+                    "rate {rate}, mode {mode:?}"
+                );
+                assert!(
+                    output.iter().flatten().any(|&sample| sample != 0.0),
+                    "rate {rate}, mode {mode:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn resampling_is_invariant_to_host_block_boundaries() {
         for rate in [8000.0, 44100.0, 48000.0, 96000.0, 384000.0] {
-            let reference = render(rate, 64, (true, false));
-            for block in [1, 7, 31, 47] {
-                let actual = render(rate, block, (true, false));
-                let mismatch = reference
-                    .iter()
-                    .zip(actual)
-                    .position(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits));
-                assert!(
-                    mismatch.is_none(),
-                    "rate {rate}, block {block}: {mismatch:?}"
-                );
+            for mode in [(true, false), (false, false), (true, true), (false, true)] {
+                let reference = render(rate, 64, mode);
+                for block in [1, 7, 31, 47] {
+                    let actual = render(rate, block, mode);
+                    let mismatch = reference
+                        .iter()
+                        .zip(actual)
+                        .position(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits));
+                    assert!(
+                        mismatch.is_none(),
+                        "rate {rate}, block {block}, mode {mode:?}: {mismatch:?}"
+                    );
+                }
             }
         }
     }
@@ -539,7 +543,69 @@ mod tests {
         assert_ne!(original, approximate);
         assert_ne!(original, fused_original);
         assert_ne!(approximate, fused_approximate);
-        assert!(fused_approximate.iter().flatten().all(|x| x.is_finite()));
+        assert_ne!(original, fused_approximate);
+        assert_ne!(approximate, fused_original);
+        assert_ne!(fused_original, fused_approximate);
+        for output in [&approximate, &fused_original, &fused_approximate] {
+            let mut peak = 0.0_f64;
+            let mut squared = 0.0;
+            output
+                .iter()
+                .flatten()
+                .zip(original.iter().flatten())
+                .for_each(|(&a, &b)| {
+                    assert!(a.is_finite());
+                    let error = (f64::from(a) - f64::from(b)).abs();
+                    peak = peak.max(error);
+                    squared += error * error;
+                });
+            let rms = (squared / (output.len() * 2) as f64).sqrt();
+            assert!(peak < 1e-5 && rms < 1e-6, "peak {peak}, RMS {rms}");
+        }
+    }
+
+    #[test]
+    fn all_four_integrated_modes_dispatch_both_delay_nodes_correctly() {
+        use oxidation_dsp::dsp::core::{ApproximateNode, BorrowedNode};
+        for mode in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut core = DspCore::new();
+            core.init(48000.0, mode.0).unwrap();
+            let mut original = BorrowedNode::default();
+            let mut approximate = ApproximateNode::default();
+            let parameters = parameters(mode.0, mode.1);
+            (0..512).for_each(|block| {
+                let mut left = std::array::from_fn::<_, HOST_BLOCK, _>(|frame| {
+                    (((block * HOST_BLOCK + frame) * 17 % 97) as f32 - 48.0) * 0.001
+                });
+                let mut right = left.map(|x| x * 0.37);
+                core.process_block(&mut left, &mut right, parameters);
+                let mut expected_original = [[0.0; 8]; HOST_BLOCK];
+                let mut expected_approximate = [[0.0; 8]; HOST_BLOCK];
+                original.process_with_acceleration(
+                    &core.state.mono[..HOST_BLOCK],
+                    &mut expected_original,
+                    parameters.node,
+                    mode.1,
+                );
+                approximate.process_with_acceleration(
+                    &core.state.mono[..HOST_BLOCK],
+                    &mut expected_approximate,
+                    parameters.node,
+                    mode.1,
+                );
+                assert_eq!(
+                    &core.state.exact_output[..HOST_BLOCK],
+                    &expected_original,
+                    "original node, mode {mode:?}, block {block}"
+                );
+                assert_eq!(
+                    &core.state.approximate_output[..HOST_BLOCK],
+                    &expected_approximate,
+                    "approximate node, mode {mode:?}, block {block}"
+                );
+                assert_eq!(core.state.mode_mix, f32::from(!mode.0));
+            });
+        }
     }
 
     #[test]

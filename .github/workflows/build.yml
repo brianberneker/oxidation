@@ -35,18 +35,33 @@ jobs:
           cargo fmt --manifest-path poc/matrix/Cargo.toml --check
       - name: Test plugin and live mode switching
         if: runner.os != 'Linux'
-        run: cargo test --locked --package oxidation --target ${{ matrix.target }}
+        run: cargo test --locked --workspace --target ${{ matrix.target }}
       - name: Test scalar and fused DSP
         if: runner.os != 'Linux'
         env:
           RUSTFLAGS: -C no-vectorize-loops -C no-vectorize-slp
-        run: cargo test --locked --release --manifest-path poc/matrix/Cargo.toml --target ${{ matrix.target }}
+        run: |
+          cargo test --locked --release --workspace --target ${{ matrix.target }}
+          cargo test --locked --release --manifest-path poc/matrix/Cargo.toml --target ${{ matrix.target }}
       - name: Build CLAP and VST3 bundles
         if: runner.os != 'Linux'
-        run: cargo xtask bundle oxidation --release --locked --target ${{ matrix.target }}
+        run: |
+          cargo xtask bundle oxidation --release --locked --target ${{ matrix.target }}
+          cargo xtask bundle oxidation-matrixverb --release --locked --target ${{ matrix.target }}
       - name: Build and test Linux using the documented command
         if: runner.os == 'Linux'
         run: sh scripts/build-linux.sh
+      - name: Compare whole MatrixVerb processor with pinned C++
+        if: runner.os != 'Windows'
+        run: sh scripts/matrixverb-reference.sh
+      - name: Compare Ultralight3 core with pinned C++
+        if: runner.os != 'Windows'
+        run: sh scripts/ultralight-reference.sh
+      - name: Verify SIMD/FMA in actual plugin bundles
+        if: runner.os != 'Windows'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.os == 'Linux' && 'target/linux' || 'target' }}
+        run: sh scripts/check-simd.sh
       - uses: actions/upload-artifact@v4
         with:
           name: oxidation-${{ matrix.target }}

@@ -1,4 +1,5 @@
 use super::state::{BorrowedState, OriginalState};
+use crate::acceleration::{f32x4, fma32, splat32};
 use crate::parameters::{NodeParameters, Parameters};
 use std::marker::PhantomData;
 
@@ -46,12 +47,12 @@ impl MatrixMath for OriginalOrder {
     #[inline(always)]
     fn transform_accelerated([a, b, c, d]: [f32; 4]) -> [f32; 4] {
         let negative_sum = -(a + b + c + d);
-        [
-            2.0_f32.mul_add(a, negative_sum),
-            2.0_f32.mul_add(b, negative_sum),
-            2.0_f32.mul_add(c, negative_sum),
-            2.0_f32.mul_add(d, negative_sum),
-        ]
+        fma32(
+            f32x4::new([a, b, c, d]),
+            splat32(2.0),
+            splat32(negative_sum),
+        )
+        .to_array()
     }
 }
 
@@ -73,12 +74,12 @@ impl MatrixMath for Balanced {
     #[inline(always)]
     fn transform_accelerated([a, b, c, d]: [f32; 4]) -> [f32; 4] {
         let negative_sum = -((a + b) + (c + d));
-        [
-            2.0_f32.mul_add(a, negative_sum),
-            2.0_f32.mul_add(b, negative_sum),
-            2.0_f32.mul_add(c, negative_sum),
-            2.0_f32.mul_add(d, negative_sum),
-        ]
+        fma32(
+            f32x4::new([a, b, c, d]),
+            splat32(2.0),
+            splat32(negative_sum),
+        )
+        .to_array()
     }
 }
 
@@ -111,7 +112,6 @@ fn filter_feedback(
     high: &mut [f32; 4],
     low: &mut [f32; 4],
     parameters: NodeParameters,
-    accelerated: bool,
 ) {
     feedback
         .iter_mut()
@@ -119,11 +119,7 @@ fn filter_feedback(
         .skip(parameters.high_pass_start())
         .for_each(|(feedback, state)| {
             *state *= 0.25;
-            *feedback = if accelerated {
-                (-*state).mul_add(0.125, *feedback)
-            } else {
-                *feedback - *state * 0.125
-            };
+            *feedback -= *state * 0.125;
             *state += *feedback;
         });
     feedback
@@ -134,6 +130,22 @@ fn filter_feedback(
             *feedback = (*feedback + *state) * 0.5;
             *state = *feedback;
         });
+}
+
+#[inline(always)]
+fn filter_feedback_simd(
+    feedback: f32x4,
+    high: &mut f32x4,
+    low: &mut f32x4,
+    [high_mask, low_mask]: [f32x4; 2],
+) -> f32x4 {
+    let decayed = *high * splat32(0.25);
+    let filtered = fma32(-decayed, splat32(0.125), feedback);
+    let feedback = high_mask.blend(filtered, feedback);
+    *high = high_mask.blend(decayed + filtered, *high);
+    let filtered = (feedback + *low) * splat32(0.5);
+    *low = low_mask.blend(filtered, *low);
+    low_mask.blend(filtered, feedback)
 }
 
 #[inline(always)]
@@ -177,6 +189,17 @@ impl<M: MatrixMath> Node<M> {
     ) {
         assert_eq!(input.len(), output.len());
         let s = &mut self.state;
+        let masks = [
+            f32x4::new(std::array::from_fn(|lane| {
+                f32::from_bits(0_u32.wrapping_sub(u32::from(lane >= parameters.high_pass_start())))
+            })),
+            f32x4::new(std::array::from_fn(|lane| {
+                f32::from_bits(0_u32.wrapping_sub(u32::from(lane < parameters.low_pass_count())))
+            })),
+        ];
+        let mut feedback = f32x4::new(s.feedback);
+        let mut high = f32x4::new(s.high);
+        let mut low = f32x4::new(s.low);
         while !input.is_empty() {
             // Stop at the first ring wrap, so all sixteen mutable windows are
             // disjoint and contiguous for the complete inner sample loop.
@@ -244,26 +267,12 @@ impl<M: MatrixMath> Node<M> {
                         let stage2 = [*e, *f, *g, *h];
                         let floor = [*i, *j, *k, *l];
                         let ceiling = [*m, *n, *o, *p];
-                        let [fa, fb, fc, fd] = s.feedback;
-                        *a = if ACCELERATED {
-                            fa.mul_add(parameters.damping(), input)
+                        [*a, *b, *c, *d] = if ACCELERATED {
+                            fma32(feedback, splat32(parameters.damping()), splat32(input))
+                                .to_array()
                         } else {
-                            fa * parameters.damping() + input
-                        };
-                        *b = if ACCELERATED {
-                            fb.mul_add(parameters.damping(), input)
-                        } else {
-                            fb * parameters.damping() + input
-                        };
-                        *c = if ACCELERATED {
-                            fc.mul_add(parameters.damping(), input)
-                        } else {
-                            fc * parameters.damping() + input
-                        };
-                        *d = if ACCELERATED {
-                            fd.mul_add(parameters.damping(), input)
-                        } else {
-                            fd * parameters.damping() + input
+                            s.feedback
+                                .map(|feedback| feedback * parameters.damping() + input)
                         };
                         [*e, *f, *g, *h] = if ACCELERATED {
                             M::transform_accelerated(stage1)
@@ -280,23 +289,27 @@ impl<M: MatrixMath> Node<M> {
                         } else {
                             M::transform(floor)
                         };
-                        s.feedback = if ACCELERATED {
-                            M::transform_accelerated(ceiling)
+                        if ACCELERATED {
+                            feedback = filter_feedback_simd(
+                                f32x4::new(M::transform_accelerated(ceiling)),
+                                &mut high,
+                                &mut low,
+                                masks,
+                            );
                         } else {
-                            M::transform(ceiling)
-                        };
-                        filter_feedback(
-                            &mut s.feedback,
-                            &mut s.high,
-                            &mut s.low,
-                            parameters,
-                            ACCELERATED,
-                        );
+                            s.feedback = M::transform(ceiling);
+                            filter_feedback(&mut s.feedback, &mut s.high, &mut s.low, parameters);
+                        }
                         *output = node_outputs(floor, ceiling);
                     },
                 );
             input = remaining_input;
             output = remaining_output;
+        }
+        if ACCELERATED {
+            s.feedback = feedback.to_array();
+            s.high = high.to_array();
+            s.low = low.to_array();
         }
     }
 }
@@ -339,7 +352,7 @@ impl OriginalNode {
             s.p.original_tick(d),
         ];
         s.feedback = DspCore::ultralight3_sample(ceiling);
-        filter_feedback(&mut s.feedback, &mut s.high, &mut s.low, parameters, false);
+        filter_feedback(&mut s.feedback, &mut s.high, &mut s.low, parameters);
         node_outputs(floor, ceiling)
     }
 
